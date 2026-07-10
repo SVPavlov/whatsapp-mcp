@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -641,7 +642,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -675,8 +676,57 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// sendGuard enforces the anti-ban discipline on all outbound sends
+// (GenAI Circle WhatsApp bridge playbook, adopted 2026-07-10):
+// a jittered minimum gap between sends and a rolling hourly cap.
+// Sends are serialized; parallel bursts queue instead of hitting WhatsApp at once.
+type sendGuard struct {
+	mu        sync.Mutex
+	lastSend  time.Time
+	sendTimes []time.Time // rolling window of successful send timestamps
+}
+
+const (
+	guardMinGap    = 2 * time.Second // minimum gap between sends
+	guardGapJitter = 3 * time.Second // random extra 0-3s on top of the gap
+	guardMaxPerHr  = 30              // rolling one-hour send cap
+)
+
+// admit blocks until the send is allowed, or returns an error if the hourly
+// cap is exhausted. Call before each outbound send.
+func (g *sendGuard) admit() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	now := time.Now()
+	cutoff := now.Add(-time.Hour)
+	kept := g.sendTimes[:0]
+	for _, t := range g.sendTimes {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	g.sendTimes = kept
+
+	if len(g.sendTimes) >= guardMaxPerHr {
+		oldest := g.sendTimes[0]
+		wait := time.Until(oldest.Add(time.Hour)).Round(time.Second)
+		return fmt.Errorf("send guard: hourly cap of %d messages reached, next slot frees in %s", guardMaxPerHr, wait)
+	}
+
+	gap := guardMinGap + time.Duration(rand.Int63n(int64(guardGapJitter)))
+	if since := now.Sub(g.lastSend); since < gap {
+		time.Sleep(gap - since)
+	}
+
+	g.lastSend = time.Now()
+	g.sendTimes = append(g.sendTimes, g.lastSend)
+	return nil
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	guard := &sendGuard{}
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -704,6 +754,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		}
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
+
+		// Anti-ban guard: paced, capped, serialized
+		if err := guard.admit(); err != nil {
+			fmt.Println("Send blocked by guard:", err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(SendMessageResponse{
+				Success: false,
+				Message: err.Error(),
+			})
+			return
+		}
 
 		// Send the message
 		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
@@ -774,8 +836,9 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server — loopback only: this API can send messages as the
+	// account owner, it must never be reachable from the network.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
@@ -800,14 +863,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -973,7 +1036,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
@@ -988,7 +1051,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

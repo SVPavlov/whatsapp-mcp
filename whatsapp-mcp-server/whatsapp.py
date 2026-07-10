@@ -328,21 +328,30 @@ def list_chats(
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
         
-        # Build base query
-        query_parts = ["""
-            SELECT 
+        # Build base query. The messages.* columns only resolve when the JOIN
+        # below is present, so select NULLs instead when it is skipped.
+        if include_last_message:
+            message_columns = """
+                messages.content as last_message,
+                messages.sender as last_sender,
+                messages.is_from_me as last_is_from_me"""
+        else:
+            message_columns = """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me"""
+        query_parts = [f"""
+            SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {message_columns}
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
             
