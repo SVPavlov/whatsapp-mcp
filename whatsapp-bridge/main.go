@@ -755,8 +755,15 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
-		// Anti-ban guard: paced, capped, serialized
-		if err := guard.admit(); err != nil {
+		// Anti-ban guard: paced, capped, serialized. Messages to the account
+		// owner's own number (Claude Code notification hook) are exempt: they
+		// carry no ban risk and must not eat the hourly budget or be delayed
+		// past the hook's 5s timeout.
+		selfSend := client.Store.ID != nil &&
+			strings.SplitN(req.Recipient, "@", 2)[0] == client.Store.ID.User
+		if selfSend {
+			fmt.Println("Self-notification send, guard bypassed")
+		} else if err := guard.admit(); err != nil {
 			fmt.Println("Send blocked by guard:", err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
