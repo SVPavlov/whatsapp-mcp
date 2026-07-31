@@ -1,5 +1,7 @@
 # WhatsApp MCP Server
 
+> **Why this fork (verified working 31 Jul 2026):** whatsmeow bumped to 2026-07-22 plus the required `context.Background()` API fixes in `main.go`, resolving the upstream "Client outdated (405)" connect failure (see lharries/whatsapp-mcp#164 — the original repo's pinned whatsmeow is rejected by WhatsApp since June 2026). Also adds a send rate-limit guard. Clone this fork instead of upstream.
+
 This is a Model Context Protocol (MCP) server for WhatsApp.
 
 With this you can search and read your personal Whatsapp messages (including images, videos, documents, and audio messages), search your contacts and send messages to either individuals or groups. You can also send media files including images, videos, documents, and audio messages.
