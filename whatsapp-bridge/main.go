@@ -669,10 +669,9 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
-
-	// Create proper direct path format
+	// Keep the query string: whatsmeow builds host + directPath + "&hash=...",
+	// and the CDN requires the signed oh/oe parameters. Stripping them gave
+	// 403 on every download (fixed 2026-11-20).
 	return "/" + pathPart
 }
 
